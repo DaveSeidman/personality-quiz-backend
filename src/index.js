@@ -1,6 +1,8 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import os from 'os'
+import process from 'process'
 import OpenAI from 'openai'
 
 dotenv.config()
@@ -8,6 +10,11 @@ dotenv.config()
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '5mb' }))
+
+const serverStartedAt = Date.now()
+let totalSessionsSinceBoot = 0
+let totalSessionsSinceLastReset = 0
+let lastResetAt = serverStartedAt
 
 function logInfo(message, meta = {}) {
   console.log(`[quiz-backend] ${message}`, Object.keys(meta).length ? meta : '')
@@ -313,6 +320,9 @@ app.post('/api/analyze', async (req, res) => {
     return res.status(400).json({ ok: false, error })
   }
 
+  totalSessionsSinceBoot += 1
+  totalSessionsSinceLastReset += 1
+
   const localResult = computeScores(req.body)
   logInfo('Local scoring complete', {
     winner: localResult.winner?.id,
@@ -375,8 +385,20 @@ app.post('/api/analyze', async (req, res) => {
   return res.json(responseBody)
 })
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'personality-quiz-backend', timestamp: new Date().toISOString() })
+app.get('/', (_req, res) => {
+  const uptimeSeconds = Math.floor((Date.now() - serverStartedAt) / 1000)
+  res.json({
+    ok: true,
+    service: 'personality-quiz-backend',
+    environment: process.env.NODE_ENV || 'development',
+    uptimeSeconds,
+    uptimeHuman: `${Math.floor(uptimeSeconds / 60)}m ${uptimeSeconds % 60}s`,
+    totalSessionsSinceBoot,
+    totalSessionsSinceLastReset,
+    lastResetAt: new Date(lastResetAt).toISOString(),
+    hostname: os.hostname(),
+    timestamp: new Date().toISOString(),
+  })
 })
 
 const PORT = Number(process.env.PORT || 3001)
