@@ -71,6 +71,106 @@ function summarizeEvents(events = []) {
   }
 }
 
+function countEvent(events = [], type) {
+  return events.filter((event) => event?.type === type).length
+}
+
+function getRevisitCount(data = {}) {
+  const eventRevisits = countEvent(data.events ?? [], 'question_revisited')
+  return Math.max(data.revisitCount ?? 0, eventRevisits)
+}
+
+function getAnswerDurationMs(data = {}) {
+  if (typeof data.answerCommittedAt === 'number' && typeof data.firstInteractionAt === 'number') {
+    return Math.max(0, data.answerCommittedAt - data.firstInteractionAt)
+  }
+  return null
+}
+
+function buildBehaviorSummary(payload) {
+  const entries = payload.questions.map((question) => {
+    const questionId = String(question.id)
+    const analyticsEntry = payload.analytics?.[questionId] ?? {}
+    const data = analyticsEntry.data ?? {}
+    const events = data.events ?? []
+
+    return {
+      questionId,
+      label: question.label || `Question ${question.id}`,
+      prompt: question.text || question.label || `Question ${question.id}`,
+      answerMs: getAnswerDurationMs(data),
+      revisitCount: getRevisitCount(data),
+      changeCount: countEvent(events, 'answer_changed'),
+      blockedNextCount: countEvent(events, 'next_clicked_blocked'),
+      interactionCount: countEvent(events, 'pointer_down'),
+      confidence: typeof analyticsEntry.confidence === 'number' ? analyticsEntry.confidence : 0.5,
+    }
+  })
+
+  const durations = entries.filter((entry) => typeof entry.answerMs === 'number')
+  const avgAnswerMs = durations.length
+    ? Math.round(durations.reduce((sum, entry) => sum + entry.answerMs, 0) / durations.length)
+    : 0
+
+  const fastestQuestion = durations.length
+    ? durations.reduce((best, entry) => (!best || entry.answerMs < best.answerMs ? entry : best), null)
+    : null
+
+  const slowestQuestion = durations.length
+    ? durations.reduce((best, entry) => (!best || entry.answerMs > best.answerMs ? entry : best), null)
+    : null
+
+  const mostRevisitedQuestion = entries
+    .filter((entry) => entry.revisitCount > 0)
+    .reduce((best, entry) => (!best || entry.revisitCount > best.revisitCount ? entry : best), null)
+
+  const mostChangedQuestion = entries
+    .filter((entry) => entry.changeCount > 1)
+    .reduce((best, entry) => (!best || entry.changeCount > best.changeCount ? entry : best), null)
+
+  return {
+    avgAnswerMs,
+    totalRevisits: entries.reduce((sum, entry) => sum + entry.revisitCount, 0),
+    totalChanges: entries.reduce((sum, entry) => sum + entry.changeCount, 0),
+    totalBlockedNext: entries.reduce((sum, entry) => sum + entry.blockedNextCount, 0),
+    fastestQuestion,
+    slowestQuestion,
+    mostRevisitedQuestion,
+    mostChangedQuestion,
+    perQuestion: entries,
+  }
+}
+
+function buildBehaviorObservation(summary) {
+  if (!summary) return ''
+
+  if (summary.avgAnswerMs > 0 && summary.avgAnswerMs < 2200) {
+    return 'You moved through the quiz unusually fast, which suggests you were leaning hard on instinct more than sitting with every option.'
+  }
+
+  if (summary.mostRevisitedQuestion?.revisitCount > 0) {
+    return `You circled back to "${summary.mostRevisitedQuestion.label}" ${summary.mostRevisitedQuestion.revisitCount} time${summary.mostRevisitedQuestion.revisitCount > 1 ? 's' : ''}, which usually points to a detail you felt was too important to answer casually.`
+  }
+
+  if (summary.slowestQuestion?.answerMs >= 6000) {
+    return `You spent the most time on "${summary.slowestQuestion.label}," which hints that this part of the brief is carrying extra weight in how you think about the event.`
+  }
+
+  if (summary.mostChangedQuestion?.changeCount > 1) {
+    return `You revised yourself most on "${summary.mostChangedQuestion.label}," which can be a sign that you were testing nuance rather than just picking the first answer that felt good.`
+  }
+
+  if (summary.totalBlockedNext > 0) {
+    return 'A few answers made you pause before committing, which reads less like hesitation and more like wanting the final mix to feel accurate.'
+  }
+
+  if (summary.avgAnswerMs >= 6500) {
+    return 'You took your time with the quiz overall, which reads like someone pressure-testing the shape of the experience before committing to a direction.'
+  }
+
+  return 'Your pattern felt fairly steady from question to question, which usually points to a clear internal picture of the kind of event you want to build.'
+}
+
 function validatePayload(payload) {
   if (!isObj(payload)) return 'Payload must be an object'
   if (!Array.isArray(payload.questions) || payload.questions.length === 0) return 'questions[] required'
@@ -195,12 +295,13 @@ function safeJsonParse(text) {
   }
 }
 
-function buildLocalStatement(personality, confidence) {
+function buildLocalStatement(personality, confidence, behaviorSummary) {
   if (!personality) return 'You showed a mixed style; a balanced sparkling water feels like the safest fit.'
 
   const pct = Math.round((confidence || 0) * 100)
   const drink = personality.drinkRecommendation || 'sparkling water with citrus'
-  return `You read as a ${personality.name} (${pct}% confidence): steady patterns suggest this is how you naturally self-regulate, so your drink match is ${drink}.`
+  const behaviorObservation = buildBehaviorObservation(behaviorSummary)
+  return `You read as ${personality.name} (${pct}% confidence), so your drink match is ${drink}. ${behaviorObservation}`
 }
 
 function buildSystemPrompt(personalities) {
@@ -221,8 +322,9 @@ Your tasks:
 1) Determine the best-fit personalityId from the available set.
 2) Infer a couple of plausible personal tendencies from behavior and choices (without overclaiming).
 3) Recommend a drink that matches the selected personality profile.
-4) Return ONE concise, personal statement that includes both the personality insight and the drink recommendation.
-5) Stay grounded in the provided payload only. Do not invent missing facts.
+4) Return ONE concise, personal statement in 2 sentences max.
+5) The statement should feel specifically tailored to this session and, when possible, mention one concrete behavior such as moving unusually fast, revisiting a question, or lingering on a specific prompt.
+6) Stay grounded in the provided payload only. Do not invent missing facts.
 
 Available personality types:
 ${personalitiesText}
@@ -231,7 +333,7 @@ Return STRICT JSON only with this shape:
 {
   "personalityId": "<one valid id>",
   "confidence": 0.0,
-  "statement": "One concise sentence personalized to this user, including a drink recommendation."
+  "statement": "A brief personalized read that includes the personality insight, a behavior-based observation, and the drink recommendation."
 }`
 }
 
@@ -239,6 +341,7 @@ async function analyzeWithOpenAI(payload, localResult) {
   if (!process.env.OPENAI_API_KEY) return null
 
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  const behaviorSummary = buildBehaviorSummary(payload)
 
   const promptPayload = {
     quizId: payload.quizId,
@@ -247,6 +350,7 @@ async function analyzeWithOpenAI(payload, localResult) {
     answers: payload.answers,
     analytics: payload.analytics,
     confidenceWeights: payload.confidenceWeights,
+    behaviorSummary,
     localScoring: {
       winner: localResult.winner,
       confidence: localResult.confidence,
@@ -291,7 +395,7 @@ async function analyzeWithOpenAI(payload, localResult) {
   const selectedPersonality = payload.personalities.find((p) => p.id === parsed.personalityId)
   const statement = typeof parsed.statement === 'string' && parsed.statement.trim().length > 0
     ? parsed.statement.trim()
-    : buildLocalStatement(selectedPersonality, clamp(Number(parsed.confidence) || localResult.confidence))
+    : buildLocalStatement(selectedPersonality, clamp(Number(parsed.confidence) || localResult.confidence), behaviorSummary)
 
   logInfo('OpenAI parsed payload', {
     personalityId: parsed.personalityId,
@@ -324,6 +428,7 @@ app.post('/api/analyze', async (req, res) => {
   totalSessionsSinceLastReset += 1
 
   const localResult = computeScores(req.body)
+  const behaviorSummary = buildBehaviorSummary(req.body)
   logInfo('Local scoring complete', {
     winner: localResult.winner?.id,
     confidence: localResult.confidence,
@@ -359,7 +464,7 @@ app.post('/api/analyze', async (req, res) => {
       personalityId: selectedPersonalityId,
       personalityName: selectedPersonality?.name || localResult.winner?.name,
       confidence: aiResult?.confidence ?? localResult.confidence,
-      statement: aiResult?.statement || buildLocalStatement(selectedPersonality, aiResult?.confidence ?? localResult.confidence),
+      statement: aiResult?.statement || buildLocalStatement(selectedPersonality, aiResult?.confidence ?? localResult.confidence, behaviorSummary),
       drinkRecommendation: selectedPersonality?.drinkRecommendation || null,
       ranking: localResult.scores.map((score) => ({
         id: score.id,
@@ -371,6 +476,7 @@ app.post('/api/analyze', async (req, res) => {
     },
     analysis: {
       perQuestion: localResult.perQuestion,
+      behaviorSummary,
       scoringWeights: req.body.confidenceWeights || null,
       submittedAt: req.body.submittedAt || Date.now(),
     },
