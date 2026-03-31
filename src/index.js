@@ -304,6 +304,13 @@ function buildLocalStatement(personality, confidence, behaviorSummary) {
   return `You read as ${personality.name} (${pct}% confidence), so your drink match is ${drink}. ${behaviorObservation}`
 }
 
+function getCanonicalPersonalityDescription(personality) {
+  if (typeof personality?.description !== 'string') return null
+
+  const description = personality.description.trim()
+  return description.length > 0 ? description : null
+}
+
 function buildSystemPrompt(personalities) {
   const personalitiesText = personalities
     .map((personality) => `- ${personality.id}: ${personality.name} (${personality.description || 'no description'}), drink: ${personality.drinkRecommendation || 'none provided'}`)
@@ -455,6 +462,12 @@ app.post('/api/analyze', async (req, res) => {
 
   const selectedPersonalityId = aiResult?.personalityId || localResult.winner?.id
   const selectedPersonality = req.body.personalities.find((p) => p.id === selectedPersonalityId)
+  const fallbackStatement = aiResult?.statement || buildLocalStatement(
+    selectedPersonality,
+    aiResult?.confidence ?? localResult.confidence,
+    behaviorSummary,
+  )
+  const canonicalDescription = getCanonicalPersonalityDescription(selectedPersonality)
 
   const responseBody = {
     ok: true,
@@ -464,7 +477,9 @@ app.post('/api/analyze', async (req, res) => {
       personalityId: selectedPersonalityId,
       personalityName: selectedPersonality?.name || localResult.winner?.name,
       confidence: aiResult?.confidence ?? localResult.confidence,
-      statement: aiResult?.statement || buildLocalStatement(selectedPersonality, aiResult?.confidence ?? localResult.confidence, behaviorSummary),
+      description: canonicalDescription,
+      statement: canonicalDescription || fallbackStatement,
+      reasoning: fallbackStatement,
       drinkRecommendation: selectedPersonality?.drinkRecommendation || null,
       ranking: localResult.scores.map((score) => ({
         id: score.id,
