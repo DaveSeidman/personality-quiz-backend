@@ -1,7 +1,10 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import { randomUUID } from 'crypto'
+import fs from 'fs/promises'
 import os from 'os'
+import path from 'path'
 import process from 'process'
 import OpenAI from 'openai'
 
@@ -27,12 +30,28 @@ function logError(message, error, meta = {}) {
   })
 }
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  timeout: Number(process.env.OPENAI_TIMEOUT_MS || 30000),
-})
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    timeout: Number(process.env.OPENAI_TIMEOUT_MS || 30000),
+  })
+  : null
 
 const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, value))
+const STORAGE_MODE = resolveStorageMode()
+const STORAGE_DIR = process.env.QUIZ_STORAGE_DIR || path.join(process.cwd(), 'data')
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '')
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'quiz_submissions'
+const EXPORT_API_KEY = process.env.EXPORT_API_KEY || ''
+
+function resolveStorageMode() {
+  const explicitMode = String(process.env.QUIZ_STORAGE_MODE || '').trim().toLowerCase()
+  if (explicitMode) return explicitMode
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) return 'supabase'
+  if (process.env.QUIZ_STORAGE_DIR) return 'file'
+  return 'none'
+}
 
 function normalizeQuestionType(type = '') {
   if (type === 'multiple-choice-text' || type === 'multiple-choice-image') return 'multiple_choice'
@@ -178,6 +197,224 @@ function validatePayload(payload) {
   if (!isObj(payload.analytics)) return 'analytics object required'
   if (!Array.isArray(payload.personalities) || payload.personalities.length < 2) return 'personalities[] required'
   return null
+}
+
+function getClientIp(req) {
+  const forwardedFor = req.headers['x-forwarded-for']
+  if (typeof forwardedFor === 'string' && forwardedFor.trim()) {
+    return forwardedFor.split(',')[0].trim()
+  }
+
+  return req.ip || req.socket?.remoteAddress || null
+}
+
+function buildRequestMeta(req) {
+  return {
+    ip: getClientIp(req),
+    user_agent: req.get('user-agent') || null,
+    referer: req.get('referer') || null,
+    origin: req.get('origin') || null,
+    host: req.get('host') || null,
+  }
+}
+
+function buildSubmissionRecord(req, payload, responseBody, durationMs) {
+  const storedAt = new Date().toISOString()
+  const submittedAt = typeof payload?.submittedAt === 'number'
+    ? new Date(payload.submittedAt).toISOString()
+    : null
+
+  return {
+    id: randomUUID(),
+    session_id: payload?.sessionId || null,
+    stored_at: storedAt,
+    submitted_at: submittedAt,
+    quiz_id: payload?.quizId || null,
+    brand_id: payload?.brandId || null,
+    brand_name: payload?.brandName || null,
+    analysis_mode: responseBody?.mode || 'local',
+    personality_id: responseBody?.result?.personalityId || null,
+    personality_name: responseBody?.result?.personalityName || null,
+    confidence: typeof responseBody?.result?.confidence === 'number' ? responseBody.result.confidence : null,
+    request_meta: buildRequestMeta(req),
+    processing_meta: {
+      duration_ms: durationMs,
+      backend_started_at: new Date(serverStartedAt).toISOString(),
+    },
+    payload,
+    response: responseBody,
+  }
+}
+
+function getStorageStatus() {
+  return {
+    mode: STORAGE_MODE,
+    enabled: STORAGE_MODE !== 'none',
+    target: STORAGE_MODE === 'supabase'
+      ? SUPABASE_TABLE
+      : STORAGE_MODE === 'file'
+        ? STORAGE_DIR
+        : null,
+  }
+}
+
+function ensureExportAuthorized(req) {
+  if (EXPORT_API_KEY) {
+    return req.get('x-export-key') === EXPORT_API_KEY || req.query.exportKey === EXPORT_API_KEY
+  }
+
+  return (process.env.NODE_ENV || 'development') !== 'production'
+}
+
+function buildDownloadFilename(brandId = '') {
+  const safeBrandId = String(brandId || 'all-brands')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '') || 'all-brands'
+  const dayKey = new Date().toISOString().slice(0, 10)
+  return `quiz-submissions-${safeBrandId}-${dayKey}.json`
+}
+
+async function persistSubmissionToFile(record) {
+  await fs.mkdir(STORAGE_DIR, { recursive: true })
+  const dayKey = record.stored_at.slice(0, 10)
+  const filePath = path.join(STORAGE_DIR, `quiz-submissions-${dayKey}.ndjson`)
+  await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8')
+  return {
+    mode: 'file',
+    target: filePath,
+  }
+}
+
+async function persistSubmissionToSupabase(record) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase storage selected but SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing')
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify([record]),
+  })
+
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`Supabase insert failed (${response.status}): ${detail.slice(0, 240)}`)
+  }
+
+  return {
+    mode: 'supabase',
+    target: SUPABASE_TABLE,
+  }
+}
+
+async function persistSubmissionRecord(record) {
+  if (STORAGE_MODE === 'none') {
+    return {
+      mode: 'none',
+      target: null,
+    }
+  }
+
+  if (STORAGE_MODE === 'file') {
+    return persistSubmissionToFile(record)
+  }
+
+  if (STORAGE_MODE === 'supabase') {
+    return persistSubmissionToSupabase(record)
+  }
+
+  throw new Error(`Unsupported storage mode: ${STORAGE_MODE}`)
+}
+
+function matchesRecordFilters(record, filters = {}) {
+  if (filters.quizId && record.quiz_id !== filters.quizId) return false
+  if (filters.brandId && record.brand_id !== filters.brandId) return false
+  if (filters.sessionId && record.session_id !== filters.sessionId) return false
+  return true
+}
+
+async function loadStoredRecordsFromFile(filters = {}) {
+  try {
+    const filenames = await fs.readdir(STORAGE_DIR)
+    const records = []
+    const limit = Math.max(1, Math.min(Number(filters.limit) || 500, 5000))
+
+    const files = filenames
+      .filter((name) => name.startsWith('quiz-submissions-') && name.endsWith('.ndjson'))
+      .sort()
+      .reverse()
+
+    for (const filename of files) {
+      const filePath = path.join(STORAGE_DIR, filename)
+      const content = await fs.readFile(filePath, 'utf8')
+      const lines = content.split('\n').filter(Boolean).reverse()
+
+      for (const line of lines) {
+        const record = JSON.parse(line)
+        if (!matchesRecordFilters(record, filters)) continue
+        records.push(record)
+        if (records.length >= limit) {
+          return records
+        }
+      }
+    }
+
+    return records
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+}
+
+async function loadStoredRecordsFromSupabase(filters = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase export selected but SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing')
+  }
+
+  const limit = Math.max(1, Math.min(Number(filters.limit) || 500, 5000))
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`)
+  url.searchParams.set('select', '*')
+  url.searchParams.set('order', 'stored_at.desc')
+  url.searchParams.set('limit', String(limit))
+
+  if (filters.quizId) {
+    url.searchParams.set('quiz_id', `eq.${filters.quizId}`)
+  }
+
+  if (filters.brandId) {
+    url.searchParams.set('brand_id', `eq.${filters.brandId}`)
+  }
+
+  if (filters.sessionId) {
+    url.searchParams.set('session_id', `eq.${filters.sessionId}`)
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      Accept: 'application/json',
+    },
+  })
+
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`Supabase export failed (${response.status}): ${detail.slice(0, 240)}`)
+  }
+
+  return response.json()
+}
+
+async function loadStoredRecords(filters = {}) {
+  if (STORAGE_MODE === 'file') return loadStoredRecordsFromFile(filters)
+  if (STORAGE_MODE === 'supabase') return loadStoredRecordsFromSupabase(filters)
+  return []
 }
 
 function computeScores(payload) {
@@ -345,7 +582,7 @@ Return STRICT JSON only with this shape:
 }
 
 async function analyzeWithOpenAI(payload, localResult) {
-  if (!process.env.OPENAI_API_KEY) return null
+  if (!openai || !process.env.OPENAI_API_KEY) return null
 
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
   const behaviorSummary = buildBehaviorSummary(payload)
@@ -497,6 +734,36 @@ app.post('/api/analyze', async (req, res) => {
     },
   }
 
+  const storageRecord = buildSubmissionRecord(req, req.body, responseBody, Date.now() - startedAt)
+  if (STORAGE_MODE !== 'none') {
+    try {
+      const storage = await persistSubmissionRecord(storageRecord)
+      responseBody.storage = {
+        ...storage,
+        enabled: true,
+        persisted: true,
+        recordId: storageRecord.id,
+      }
+    } catch (storageError) {
+      logError('Submission persistence failed', storageError, {
+        quizId: req.body?.quizId,
+        sessionId: req.body?.sessionId,
+      })
+      return res.status(503).json({
+        ok: false,
+        error: 'Unable to save quiz submission',
+        retryable: true,
+      })
+    }
+  } else {
+    responseBody.storage = {
+      mode: 'none',
+      enabled: false,
+      persisted: false,
+      recordId: null,
+    }
+  }
+
   logInfo('Analyze request complete', {
     mode,
     personalityId: responseBody.result.personalityId,
@@ -504,6 +771,67 @@ app.post('/api/analyze', async (req, res) => {
   })
 
   return res.json(responseBody)
+})
+
+app.get('/api/submissions/export', async (req, res) => {
+  if (!ensureExportAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'Export authorization required' })
+  }
+
+  if (STORAGE_MODE === 'none') {
+    return res.status(400).json({ ok: false, error: 'Submission storage is disabled' })
+  }
+
+  try {
+    const records = await loadStoredRecords({
+      quizId: req.query.quizId,
+      brandId: req.query.brandId,
+      sessionId: req.query.sessionId,
+      limit: req.query.limit,
+    })
+
+    return res.json({
+      ok: true,
+      mode: STORAGE_MODE,
+      total: records.length,
+      items: records,
+    })
+  } catch (error) {
+    logError('Submission export failed', error)
+    return res.status(500).json({ ok: false, error: 'Unable to export submissions' })
+  }
+})
+
+app.get('/api/submissions/download', async (req, res) => {
+  if (!ensureExportAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'Export authorization required' })
+  }
+
+  if (STORAGE_MODE === 'none') {
+    return res.status(400).json({ ok: false, error: 'Submission storage is disabled' })
+  }
+
+  const brandId = req.query.brandId || ''
+
+  try {
+    const records = await loadStoredRecords({
+      brandId,
+      quizId: req.query.quizId,
+      sessionId: req.query.sessionId,
+      limit: req.query.limit || 5000,
+    })
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${buildDownloadFilename(brandId)}"`,
+    )
+
+    return res.send(JSON.stringify(records, null, 2))
+  } catch (error) {
+    logError('Submission download failed', error, { brandId })
+    return res.status(500).json({ ok: false, error: 'Unable to download submissions' })
+  }
 })
 
 app.get('/', (_req, res) => {
@@ -518,6 +846,7 @@ app.get('/', (_req, res) => {
     totalSessionsSinceLastReset,
     lastResetAt: new Date(lastResetAt).toISOString(),
     hostname: os.hostname(),
+    storage: getStorageStatus(),
     timestamp: new Date().toISOString(),
   })
 })
@@ -527,5 +856,6 @@ app.listen(PORT, () => {
   logInfo(`Server listening on http://localhost:${PORT}`, {
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
     model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    storageMode: STORAGE_MODE,
   })
 })
