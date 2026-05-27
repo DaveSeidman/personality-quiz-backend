@@ -852,10 +852,25 @@ app.get('/', (_req, res) => {
 })
 
 const PORT = Number(process.env.PORT || 3001)
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   logInfo(`Server listening on http://localhost:${PORT}`, {
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
     model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
     storageMode: STORAGE_MODE,
   })
+})
+
+server.on('error', (error) => {
+  logError('Server failed to listen', error, { port: PORT })
+  process.exitCode = 1
+})
+
+process.on('SIGTERM', () => {
+  logInfo('Received SIGTERM, shutting down')
+  server.close(() => process.exit(0))
+})
+
+process.on('SIGINT', () => {
+  logInfo('Received SIGINT, shutting down')
+  server.close(() => process.exit(0))
 })
